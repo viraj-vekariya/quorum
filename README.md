@@ -64,6 +64,7 @@ about them.
 | **Leader Completeness / Figure 8 safety** — a leader only commits entries from its *own* current term directly; earlier-term entries are committed only as a side effect | `TryAdvanceCommitIndexLocked`'s `TermAtLocked(n) != current_term_` guard, plus a no-op entry appended on election so a new leader always has *something* from its own term to commit | see "Hardest bug" below — this is the one that actually broke |
 | **No progress without a majority** | commit only advances when `count > cluster_size_/2` | `minority_partition_makes_no_progress_majority_does` |
 | **Stale leader steps down** | any RPC/reply carrying a higher term reverts the node to Follower | same test — the isolated leader is confirmed to give up leadership once the partition heals |
+| **Linearizable reads (ReadIndex)** — `Get()` requires a live majority confirmation of the current term before answering, not just a locally-cached belief about being leader | `BroadcastAppendEntriesLocked`'s return value (ack count) checked against `cluster_size_/2` inside `Get()`, plus a term/role recheck after the round completes | `partitioned_leader_fails_readindex_confirmation_before_it_would_otherwise_notice` — isolates the leader the instant a partition starts, before it could possibly have noticed via timeout, and confirms it refuses to answer |
 
 `ElectionLog` deserves a callout: polling `GetRole()` periodically can miss a
 node that won and then lost leadership between two polls. Every real
@@ -114,13 +115,15 @@ afterthought. Fixed by making `listen_fd_` a `std::atomic<int>`.
   **not** a true process crash that loses volatile state and rejoins fresh.
   Persisting to disk (and handling a node that rejoins with *no* prior
   state, which needs a snapshot-transfer path) is the natural next step.
-- **Reads are not linearizable.** `Get()` serves from the local applied
-  state of whichever node the caller believes is the leader. A real
-  deployment needs the read-index or lease-read protocol from the extended
-  Raft paper to guarantee a read reflects the latest committed write — this
-  implementation doesn't have either, so a stale leader that hasn't yet
-  learned it's been deposed could serve a stale read for up to one election
-  timeout.
+- **Reads pay a round trip, on purpose.** `Get()` now implements the
+  ReadIndex protocol (see the safety-properties table above) — every single
+  call runs a live confirmation round, with no leader lease cached across
+  calls. That's a deliberate simplicity-over-latency tradeoff: a real
+  deployment would typically add a time-bounded leader lease (elect a
+  "lease" the leader can trust for some bounded window without re-confirming
+  every read) to avoid paying network round-trip latency on every read.
+  This implementation doesn't have that optimization, so every `Get()` costs
+  roughly one heartbeat round trip — correct, but not as fast as it could be.
 - **No log compaction / snapshotting.** The log grows unboundedly; a
   long-running cluster would need periodic snapshots (Raft paper §7).
 - **Thread-per-RPC, not an event loop.** Elections and heartbeat broadcasts
