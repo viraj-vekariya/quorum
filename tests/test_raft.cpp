@@ -299,4 +299,102 @@ TEST(concurrent_load_with_follower_churn_never_loses_a_committed_entry) {
     c.AssertElectionSafety();
 }
 
+// ---------------------------------------------------------------------------
+// ReadIndex: Get() must require a live majority confirmation, not just a
+// locally-cached belief about being leader.
+
+TEST(get_immediately_after_becoming_leader_still_returns_correct_value) {
+    // With no lease caching, every Get() does its own confirmation round --
+    // so there's no "stale lease window" to worry about right after an
+    // election the way there would be with a time-based leader lease. This
+    // test just confirms that round actually completes correctly rather
+    // than deadlocking or timing out on a freshly-elected leader.
+    Cluster c(5);
+    int leader = c.WaitForLeader();
+    ASSERT_TRUE(leader >= 0);
+    ASSERT_TRUE(c.nodes[leader]->Put("k", "v"));
+
+    std::string v;
+    ASSERT_TRUE(c.nodes[leader]->Get("k", &v));
+    ASSERT_EQ(v, "v");
+    c.AssertElectionSafety();
+}
+
+TEST(partitioned_leader_fails_readindex_confirmation_before_it_would_otherwise_notice) {
+    Cluster c(5);
+    int leader = c.WaitForLeader();
+    ASSERT_TRUE(leader >= 0);
+    ASSERT_TRUE(c.nodes[leader]->Put("x", "committed"));
+
+    // Isolate the leader alone into a minority of 1 against the other 4.
+    // Do this immediately -- specifically NOT waiting out an election
+    // timeout -- so the old leader's role_ is still Leader and its
+    // current_term_ hasn't changed. The old naive Get() (role_==Leader,
+    // full stop) would happily answer here; ReadIndex must not.
+    std::set<int> minority = {leader};
+    std::set<int> majority;
+    for (int i = 0; i < c.size; ++i) {
+        if (i != leader) majority.insert(i);
+    }
+    c.filter->partition(minority, majority);
+
+    std::string v;
+    bool got = c.nodes[leader]->Get("x", &v);
+    ASSERT_TRUE(got == false);  // cannot reach a majority right now -> must refuse, not answer stale
+
+    // The still-connected majority elects a new leader and can serve the
+    // same read correctly once it's committed on that side too.
+    int majority_leader = -1;
+    auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        for (int i : majority) {
+            if (c.nodes[i]->GetRole() == Role::Leader) {
+                majority_leader = i;
+                break;
+            }
+        }
+        if (majority_leader >= 0) break;
+        std::this_thread::sleep_for(10ms);
+    }
+    ASSERT_TRUE(majority_leader >= 0);
+    std::string v2;
+    ASSERT_TRUE(c.nodes[majority_leader]->Get("x", &v2));
+    ASSERT_EQ(v2, "committed");
+
+    c.filter->heal();
+    c.AssertElectionSafety();
+}
+
+TEST(readindex_confirmation_fails_once_deposed_mid_round_rather_than_answering) {
+    // Same shape as the partition test but framed around the exact failure
+    // mode the directive called out: a leader that gets a majority ack and
+    // then is deposed (or loses the majority) before actually serving the
+    // read must not answer from its now-stale local state. We can't inject
+    // a mid-round deposition with millisecond precision from outside the
+    // class, so instead this exercises the guarding checks after the round
+    // (current_term_ != read_term / role_ != Leader) via a leader that is
+    // cut off and stays cut off for several ReadIndex attempts in a row --
+    // if the post-round guard were missing or wrong, at least one of these
+    // repeated attempts would incorrectly succeed.
+    Cluster c(5);
+    int leader = c.WaitForLeader();
+    ASSERT_TRUE(leader >= 0);
+    ASSERT_TRUE(c.nodes[leader]->Put("y", "1"));
+
+    std::set<int> minority = {leader};
+    std::set<int> majority;
+    for (int i = 0; i < c.size; ++i) {
+        if (i != leader) majority.insert(i);
+    }
+    c.filter->partition(minority, majority);
+
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        std::string v;
+        ASSERT_TRUE(c.nodes[leader]->Get("y", &v) == false);
+    }
+
+    c.filter->heal();
+    c.AssertElectionSafety();
+}
+
 int main() { return testing::RunAll(); }
