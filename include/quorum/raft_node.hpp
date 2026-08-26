@@ -30,6 +30,15 @@ public:
     // this node isn't the leader, or after a bounded wait if the entry never
     // commits (e.g. this node was deposed before replicating it).
     bool Put(const std::string& key, const std::string& value);
+
+    // Linearizable read via the ReadIndex protocol: before serving from
+    // local state, this runs a live AppendEntries round and requires a
+    // majority to acknowledge at the term this call started with. Only a
+    // leader that is STILL provably a majority-recognized leader for this
+    // exact term, right now, will answer -- a partitioned former leader that
+    // hasn't yet noticed a higher term will fail to get quorum and return
+    // false rather than serve a stale value. See README for the guarantee
+    // this does and does not provide.
     bool Get(const std::string& key, std::string* out_value);
 
     // Test/demo introspection.
@@ -47,7 +56,12 @@ public:
 private:
     void TickerLoop();
     void StartElectionLocked(std::unique_lock<std::mutex>& lock);
-    void BroadcastAppendEntriesLocked(std::unique_lock<std::mutex>& lock);
+    // Returns the number of nodes (including self) that acknowledged this
+    // round at `current_term_` as it was when the round started -- i.e. a
+    // live quorum-confirmation count, not just "heartbeat sent". Used both
+    // as an ordinary heartbeat (return value ignored) and, by Get(), as the
+    // ReadIndex leadership-confirmation round.
+    int BroadcastAppendEntriesLocked(std::unique_lock<std::mutex>& lock);
     void BecomeLeaderLocked(std::unique_lock<std::mutex>& lock);
     void TryAdvanceCommitIndexLocked();
     void ApplyCommittedLocked();

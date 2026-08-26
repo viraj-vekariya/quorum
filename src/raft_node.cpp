@@ -155,9 +155,18 @@ void RaftNode::BecomeLeaderLocked(std::unique_lock<std::mutex>& lock) {
 // ---------------------------------------------------------------------------
 // Replication
 
-void RaftNode::BroadcastAppendEntriesLocked(std::unique_lock<std::mutex>& lock) {
-    if (role_ != Role::Leader) return;
+int RaftNode::BroadcastAppendEntriesLocked(std::unique_lock<std::mutex>& lock) {
+    if (role_ != Role::Leader) return 0;
     int64_t my_term = current_term_;
+    // Acks a reply that proves the peer still recognizes my_term as current
+    // -- reply.ok (message actually got through) and reply.term == my_term
+    // (the peer didn't already have a higher term). This is true regardless
+    // of reply.success: a log-mismatch ("false") reply still proves the peer
+    // is following me as leader at this term, which is all ReadIndex needs.
+    // A peer can never reply with a term BELOW my_term (OnAppendEntries always
+    // bumps its own term up to at least args.term before setting reply.term),
+    // so > means stale (handled below) and == means confirmed.
+    std::atomic<int> acks{1};  // count self; senders below are joined before this function returns
 
     struct PeerCall {
         int peer;
@@ -181,7 +190,7 @@ void RaftNode::BroadcastAppendEntriesLocked(std::unique_lock<std::mutex>& lock) 
 
     std::vector<std::thread> senders;
     for (auto& call : calls) {
-        senders.emplace_back([this, call, my_term]() {
+        senders.emplace_back([this, call, my_term, &acks]() {
             AppendEntriesReply reply = transport_.SendAppendEntries(call.peer, call.args);
             if (!reply.ok) return;
 
@@ -193,6 +202,11 @@ void RaftNode::BroadcastAppendEntriesLocked(std::unique_lock<std::mutex>& lock) 
                 return;
             }
             if (role_ != Role::Leader || current_term_ != my_term) return;  // stale reply
+
+            // Reaching here means: this peer did not report a term above
+            // ours, and nothing else invalidated my_term while this reply
+            // was in flight -- a live, current-term acknowledgment.
+            ++acks;
 
             if (reply.success) {
                 next_index_[call.peer] = call.entries_end_index + 1;
@@ -221,6 +235,7 @@ void RaftNode::BroadcastAppendEntriesLocked(std::unique_lock<std::mutex>& lock) 
     for (auto& t : senders) t.join();
 
     lock.lock();
+    return acks.load();
 }
 
 void RaftNode::TryAdvanceCommitIndexLocked() {
@@ -371,13 +386,39 @@ bool RaftNode::Put(const std::string& key, const std::string& value) {
 }
 
 bool RaftNode::Get(const std::string& key, std::string* out_value) {
-    // Serves from local applied state. NOT linearizable: a partitioned former
-    // leader that hasn't yet stepped down could serve a stale value. A real
-    // deployment would need the read-index or lease-read protocol from the
-    // Raft paper's extended version -- deliberately out of scope here, see
-    // README Limitations.
-    std::lock_guard<std::mutex> lock(mu_);
+    // ReadIndex protocol (Raft extended paper §6.4 / etcd's raft library):
+    // before trusting local state, run a LIVE AppendEntries round and
+    // require a majority to acknowledge it at the term this call started
+    // with. No lease/timer is cached across calls -- every Get() pays a
+    // fresh round trip, in exchange for not having to reason about clock
+    // skew or lease-expiry edge cases. See README for the exact guarantee.
+    std::unique_lock<std::mutex> lock(mu_);
     if (role_ != Role::Leader) return false;
+    int64_t read_index = commit_index_;
+    int64_t read_term = current_term_;
+
+    int acks = BroadcastAppendEntriesLocked(lock);  // unlocks internally, relocks before returning
+
+    // Reject if anything invalidated this term while confirming, or if we
+    // didn't actually hear back from a majority just now -- a partitioned
+    // former leader will reliably fail this even if it hasn't yet noticed
+    // (via RequestVote/AppendEntries) that it's been deposed.
+    if (role_ != Role::Leader || current_term_ != read_term) return false;
+    if (acks <= cluster_size_ / 2) return false;
+
+    // The confirmation round only proves leadership, not that this node's
+    // state machine has replayed up to read_index yet (it almost always
+    // has, since read_index <= commit_index_ from before the round even
+    // started -- but be exact rather than assume).
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (last_applied_ < read_index) {
+        if (role_ != Role::Leader || current_term_ != read_term) return false;
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        lock.lock();
+    }
+
     auto it = kv_.find(key);
     if (it == kv_.end()) return false;
     *out_value = it->second;
